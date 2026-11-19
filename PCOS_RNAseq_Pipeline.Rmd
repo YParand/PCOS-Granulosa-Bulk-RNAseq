@@ -1,0 +1,265 @@
+---
+title: "Bulk RNA-seq Transcriptomic Analysis of Granulosa Cells in PCOS"
+subtitle: "Differential Expression (DESeq2), Pathway Enrichment (GO/KEGG), GSEA, and PPI Network Preparation (GSE138518)"
+author: "Mohammad Reza Yavari Parand"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+    df_print: paged
+params:
+  input_file:
+    label: "Select Input Counts Excel File (.xlsx):"
+    value: "data/GSE138518_RNA.xlsx"
+    input: file
+  output_dir:
+    label: "Select Output Directory:"
+    value: "outputs"
+    input: text
+---
+
+```{r setup, include=TRUE}
+library(readxl)
+library(dplyr)
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+
+# Define dynamic paths based on user parameters
+input_path  <- params$input_file
+out_base    <- params$output_dir
+results_dir <- file.path(out_base, "results")
+figures_dir <- file.path(out_base, "figures")
+
+# Create output subdirectories automatically if they do not exist
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Verify input file existence
+if (!file.exists(input_path)) {
+  stop(paste("Input file not found at:", input_path, 
+             "\nPlease place your file in the 'data/' folder or select it via 'Knit with Parameters'."))
+}
+
+message("Input file loaded from: ", normalizePath(input_path))
+message("Outputs will be saved to: ", normalizePath(out_base))
+
+# Read raw expression matrix
+counts_data <- read_excel(input_path)
+gene_info   <- counts_data[, 1:3]
+raw_counts  <- counts_data[, 4:9]
+
+# Ensure integer counts and assign Gene Symbols as rownames
+raw_counts_int <- round(as.matrix(raw_counts))
+rownames(raw_counts_int) <- counts_data$SYMBOL
+
+# Construct sample metadata (N = Control, P = PCOS)
+sample_names <- colnames(raw_counts_int)
+group_labels <- ifelse(grepl("^N", sample_names), "Control", "PCOS")
+
+colData <- data.frame(
+  row.names = sample_names,
+  condition = as.factor(group_labels)
+)
+
+# Filter out unexpressed/low-count genes
+keep <- rowSums(raw_counts_int) > 1
+counts_filtered <- raw_counts_int[keep, ]
+
+# Run DESeq2 pipeline
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_filtered,
+  colData   = colData,
+  design    = ~ condition
+)
+dds <- DESeq(dds)
+
+# Extract results (PCOS vs Control)
+res <- results(dds, contrast = c("condition", "PCOS", "Control"))
+resOrdered <- res[order(res$padj), ]
+
+# Export full DEG table
+write.csv(as.data.frame(resOrdered), 
+          file = file.path(results_dir, "DEG_PCOS_vs_Control.csv"))
+
+# Display top differentially expressed genes
+head(as.data.frame(resOrdered), 10)
+
+res_df <- as.data.frame(res)
+res_df$gene <- rownames(res_df)
+res_df$expression <- "Not Significant"
+res_df$expression[res_df$padj < 0.1 & res_df$log2FoldChange > 1]  <- "Upregulated"
+res_df$expression[res_df$padj < 0.1 & res_df$log2FoldChange < -1] <- "Downregulated"
+res_df$expression <- as.factor(res_df$expression)
+
+# Label top 15 most significant genes with extreme fold changes
+res_df$delabel <- NA
+top_genes <- res_df[res_df$padj < 0.001 & abs(res_df$log2FoldChange) > 3, ]
+top_genes <- head(top_genes[order(top_genes$padj), ], 15)
+res_df$delabel[res_df$gene %in% top_genes$gene] <- res_df$gene[res_df$gene %in% top_genes$gene]
+
+p_volcano <- ggplot(res_df, aes(x = log2FoldChange, y = -log10(pvalue), color = expression, label = delabel)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("Upregulated" = "#E41A1C", 
+                                "Downregulated" = "#377EB8", 
+                                "Not Significant" = "grey")) +
+  geom_text_repel(size = 3, color = "black", max.overlaps = 20, box.padding = 0.3) +
+  theme_minimal() +
+  labs(title = "Volcano Plot: PCOS vs Control", 
+       x = "Log2 Fold Change", 
+       y = "-Log10 p-value", 
+       color = "Expression") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), legend.position = "right") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black", alpha = 0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", alpha = 0.5)
+
+print(p_volcano)
+
+ggsave(filename = file.path(figures_dir, "Volcano_Plot_PCOS_Clean_Labeled.jpg"), 
+       plot = p_volcano, width = 8, height = 6, dpi = 300, device = "jpeg")
+
+
+vsd <- vst(dds, blind = FALSE)
+top50_genes <- head(order(res$padj), 50)
+mat <- assay(vsd)[top50_genes, ]
+mat_scaled <- t(scale(t(mat)))
+
+annotation_col <- data.frame(Condition = colData$condition, row.names = rownames(colData))
+ann_colors <- list(Condition = c(Control = "#377EB8", PCOS = "#E41A1C"))
+heatmap_colors <- colorRampPalette(c("#377EB8", "white", "#E41A1C"))(100)
+
+# Render in HTML report
+pheatmap(mat_scaled,
+         color = heatmap_colors,
+         annotation_col = annotation_col,
+         annotation_colors = ann_colors,
+         cluster_rows = TRUE, cluster_cols = TRUE,
+         show_rownames = TRUE, show_colnames = TRUE,
+         border_color = NA, fontsize_row = 7.5, fontsize_col = 10,
+         main = "Top 50 Differentially Expressed Genes (PCOS vs Control)")
+
+# Save high-resolution image
+pheatmap(mat_scaled,
+         color = heatmap_colors,
+         annotation_col = annotation_col,
+         annotation_colors = ann_colors,
+         cluster_rows = TRUE, cluster_cols = TRUE,
+         show_rownames = TRUE, show_colnames = TRUE,
+         border_color = NA, fontsize_row = 7.5, fontsize_col = 10,
+         main = "Top 50 Differentially Expressed Genes (PCOS vs Control)",
+         filename = file.path(figures_dir, "Heatmap_Top50_PCOS.jpg"),
+         width = 7, height = 9)
+
+
+deg_genes <- res_df$gene[which(res_df$padj < 0.1 & !is.na(res_df$padj))]
+
+gene_ids <- bitr(deg_genes, 
+                 fromType = "SYMBOL", 
+                 toType   = "ENTREZID", 
+                 OrgDb    = org.Hs.eg.db)
+
+# GO Biological Processes
+ego <- enrichGO(gene          = gene_ids$ENTREZID,
+                OrgDb         = org.Hs.eg.db,
+                keyType       = "ENTREZID",
+                ont           = "BP",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.05,
+                qvalueCutoff  = 0.2,
+                readable      = TRUE)
+
+write.csv(as.data.frame(ego), file = file.path(results_dir, "GO_BP_Enrichment_Results.csv"), row.names = FALSE)
+
+# Dotplot of Top 15 GO Terms
+if (nrow(as.data.frame(ego)) > 0) {
+  p_go_dot <- dotplot(ego, showCategory = 15, title = "GO Biological Processes (PCOS vs Control)") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          axis.text.y = element_text(size = 10, color = "black"))
+  
+  print(p_go_dot)
+  ggsave(filename = file.path(figures_dir, "GO_BP_Dotplot.jpg"), plot = p_go_dot, width = 9, height = 7, dpi = 300, device = "jpeg")
+}
+
+# KEGG Pathway Enrichment
+kegg_res <- enrichKEGG(gene = gene_ids$ENTREZID, organism = 'hsa', pvalueCutoff = 0.05)
+kegg_res <- setReadable(kegg_res, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+write.csv(as.data.frame(kegg_res), file = file.path(results_dir, "KEGG_Pathway_Enrichment_Results.csv"), row.names = FALSE)
+
+if (nrow(as.data.frame(kegg_res)) > 0) {
+  p_kegg_bar <- barplot(kegg_res, showCategory = 15, title = "KEGG Pathway Enrichment") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          axis.text.y = element_text(size = 10, color = "black"))
+  
+  print(p_kegg_bar)
+  ggsave(filename = file.path(figures_dir, "KEGG_Pathway_Barplot.jpg"), plot = p_kegg_bar, width = 8.5, height = 6.5, dpi = 300, device = "jpeg")
+}
+
+
+if (nrow(as.data.frame(ego)) > 0) {
+  gene_list_fc <- res_df$log2FoldChange
+  names(gene_list_fc) <- res_df$gene
+  gene_list_fc <- na.omit(gene_list_fc)
+  
+  p_cnet <- cnetplot(ego, showCategory = 5, foldChange = gene_list_fc, circular = FALSE, colorEdge = TRUE) +
+    scale_color_gradient2(name = "Log2 Fold Change", low = "#377EB8", mid = "white", high = "#E41A1C") +
+    labs(title = "Gene-Concept Network of Top 5 GO Terms") +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14))
+  
+  print(p_cnet)
+  ggsave(filename = file.path(figures_dir, "GO_Gene_Concept_Network.jpg"), plot = p_cnet, width = 10, height = 8, dpi = 300, device = "jpeg")
+}
+
+res_gsea_df <- na.omit(res_df)
+entrez_ids_gsea <- bitr(res_gsea_df$gene, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+merged_gsea <- merge(res_gsea_df, entrez_ids_gsea, by.x = "gene", by.y = "SYMBOL")
+
+geneList <- merged_gsea$log2FoldChange
+names(geneList) <- merged_gsea$ENTREZID
+geneList <- sort(geneList, decreasing = TRUE)
+
+gsea_go <- gseGO(geneList     = geneList,
+                 OrgDb        = org.Hs.eg.db,
+                 ont          = "BP",
+                 minGSSize    = 15,
+                 maxGSSize    = 500,
+                 pvalueCutoff = 0.05,
+                 verbose      = FALSE)
+
+# اصلاحیه شرطی ایمن برای جلوگیری از خطای setReadable در صورت خالی بودن خروجی GSEA
+if (!is.null(gsea_go) && nrow(as.data.frame(gsea_go)) > 0) {
+  gsea_go <- setReadable(gsea_go, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+  write.csv(as.data.frame(gsea_go), file = file.path(results_dir, "GSEA_GO_Results.csv"), row.names = FALSE)
+  
+  p_ridge <- ridgeplot(gsea_go, showCategory = 15) + 
+    theme_minimal(base_size = 11) +
+    labs(title = "GSEA Ridgeplot: Biological Processes") +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+  
+  print(p_ridge)
+  ggsave(filename = file.path(figures_dir, "GSE_GO_Ridgeplot.jpg"), plot = p_ridge, width = 10, height = 8, dpi = 300, device = "jpeg")
+} else {
+  message("No significant GSEA terms found at the current p-value cutoff.")
+}
+
+sig_deg_df <- res_df %>% filter(padj < 0.1 & abs(log2FoldChange) > 1)
+
+ppi_input_data <- data.frame(
+  gene   = rownames(sig_deg_df),
+  log2FC = sig_deg_df$log2FoldChange,
+  padj   = sig_deg_df$padj
+)
+
+write.csv(ppi_input_data, file = file.path(results_dir, "Hub_Genes_PPI_Input.csv"), row.names = FALSE)
+knitr::kable(head(ppi_input_data, 10), caption = "Top 10 Significant DEGs Exported for PPI Network Analysis")
+
+sessionInfo()
+
